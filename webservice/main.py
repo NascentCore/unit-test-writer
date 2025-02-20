@@ -1,206 +1,128 @@
-import asyncio
 import os
-import sys
-import traceback
-from typing import Optional
-
-import aiohttp
-from aiohttp import web
-import cachetools
-from gidgethub import aiohttp as gh_aiohttp
-from gidgethub import routing
-from gidgethub import sansio
-from gidgethub import apps
-
+import base64
+import json
+import re
+import time
+import jwt
+import requests
+from github import Github
+from flask import Flask, request, jsonify
+from github import Auth
 from dotenv import load_dotenv
-
 # 从.env文件加载环境变量
 load_dotenv()
+app = Flask(__name__)
+# GitHub App 配置信息
+GITHUB_APP_ID = os.getenv("GITHUB_APP_ID")
+GITHUB_PRIVATE_KEY = os.getenv("GITHUB_PRIVATE_KEY")
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
 
-# 配置常量
-CACHE_SIZE = 500
-DEFAULT_PORT = 8080
+# 用来获取 GitHub App 安装访问令牌
+def get_installation_access_token(installation_id):
+    now = int(time.time())
+    payload = {
+        "iat": now - 60,  # 即将到期的JWT的发放时间
+        "exp": now + (10 * 60),  # JWT到期时间
+        "iss": GITHUB_APP_ID,
+    }
+    # 使用私钥签名JWT
+    jwt_token = jwt.encode(payload, GITHUB_PRIVATE_KEY, algorithm="RS256")
+    # 获取访问令牌
+    url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+    headers = {"Authorization": f"Bearer {jwt_token}", "Accept": "application/vnd.github.v3+json"}
+    response = requests.post(url, headers=headers)
+    if response.status_code == 201:
+        return response.json()["token"]
+    else:
+        raise Exception("Unable to get installation access token")
 
-router = routing.Router()
-cache = cachetools.LRUCache(maxsize=CACHE_SIZE)
-routes = web.RouteTableDef()
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    payload = request.get_data()
+    event = request.headers.get('X-GitHub-Event')
+    if event == 'push':
+        push_data = json.loads(payload)
+        # 获取仓库信息
+        repo_name = push_data['repository']['full_name']
+        installation_id = push_data['installation']['id']
+        # 获取安装令牌
+        installation_access_token = get_installation_access_token(installation_id)
+        repo = Github(installation_access_token).get_repo(repo_name)
+        if push_data['pusher']['name'] == 'unit-test-writer-1[bot]':
+            return jsonify({"message": "Push event handled"}), 200
+        check_and_generate_tests(repo, push_data)
+        return jsonify({"message": "Push event handled"}), 200
+    return jsonify({"message": "Event not handled"}), 200
 
-async def get_installation_token(gh: gh_aiohttp.GitHubAPI, installation_id: int) -> dict:
-    """获取GitHub App的安装访问令牌"""
-    return await apps.get_installation_access_token(
-        gh,
-        installation_id=installation_id,
-        app_id=os.environ.get("GH_APP_ID"),
-        private_key=os.environ.get("GH_PRIVATE_KEY")
-    )
-
-@routes.get("/", name="home")
-async def handle_get(request: web.Request) -> web.Response:
-    """处理首页GET请求"""
-    return web.Response(text="Hello PyLadies Tunis")
-
-@routes.post("/webhook")
-async def webhook(request: web.Request) -> web.Response:
-    """处理GitHub webhook请求"""
-    try:
-        body = await request.read()
-        secret = os.environ.get("GH_SECRET")
-        event = sansio.Event.from_http(request.headers, body, secret=secret)
-        print(f"收到事件: {event.event}")
-        
-        if event.event == "ping":
-            return web.Response(status=200)
-            
-        async with aiohttp.ClientSession() as session:
-            gh = gh_aiohttp.GitHubAPI(session, "demo", cache=cache)
-            await router.dispatch(event, gh)
-            
-            try:
-                print("GH requests remaining:", gh.rate_limit.remaining)
-            except AttributeError:
-                pass
-                
-        return web.Response(status=200)
-        
-    except Exception as exc:
-        traceback.print_exc(file=sys.stderr)
-        return web.Response(status=500)
-
-@router.register("installation", action="created")
-async def repo_installation_added(event, gh, *args, **kwargs):
-    """处理GitHub App安装事件"""
-    installation_id = event.data["installation"]["id"]
-    installation_token = await get_installation_token(gh, installation_id)
-    
-    repo_name = event.data["repositories"][0]["full_name"]
-    url = f"/repos/{repo_name}/issues"
-    
-    response = await gh.post(
-        url,
-        data={
-            'title': '感谢安装本机器人',
-            'body': '我会为您提供优质的服务!',
-        },
-        oauth_token=installation_token["token"]
-    )
-    print(response)
-
-@router.register("pull_request", action="opened")
-async def pr_opened(event, gh, *args, **kwargs):
-    """处理新的Pull Request被打开的事件"""
-    installation_id = event.data["installation"]["id"]
-    installation_token = await get_installation_token(gh, installation_id)
-
-    # 获取PR相关信息
-    repo_full_name = event.data["repository"]["full_name"]
-    pr_number = event.data["pull_request"]["number"]
-    
-    # 获取PR中的文件列表
-    files_url = f"/repos/{repo_full_name}/pulls/{pr_number}/files"
-    files = await gh.getitem(files_url, oauth_token=installation_token["token"])
-    
-    # 遍历文件列表,找出Python文件并获取内容
-    python_files = []
-    async with aiohttp.ClientSession() as session:
-        for file in files:
-            if file["filename"].endswith(".py"):
-                async with session.get(file["raw_url"]) as response:
-                    content = await response.text()
-                    python_files.append({
-                        "name": file["filename"],
-                        "content": content
-                    })
-    
-    if not python_files:
+def check_and_generate_tests(repo, push_data):
+    # 获取推送的文件
+    ref = push_data['ref']
+    # 修改分支名获取逻辑，去掉 'refs/heads/' 前缀
+    branch = ref.replace('refs/heads/', '')
+    contents = repo.get_contents("", ref=branch)
+    # 检查文件并提取没有单元测试的函数
+    function_names = extract_functions_without_tests(contents)
+    if not function_names:
+        print("No functions need tests.")
         return
-        
-    # 创建新分支
-    branch_name = f"add-tests-{pr_number}"
-    main_branch = await gh.getitem(
-        f"/repos/{repo_full_name}/git/ref/heads/main",
-        oauth_token=installation_token["token"]
-    )
-    await gh.post(
-        f"/repos/{repo_full_name}/git/refs",
-        data={
-            "ref": f"refs/heads/{branch_name}",
-            "sha": main_branch["object"]["sha"]
-        },
-        oauth_token=installation_token["token"]
-    )
+    # 生成单元测试代码
+    test_code = generate_unit_tests(function_names)
+    # 提交单元测试代码到一个新的文件
+    create_pr_with_tests(repo, branch, test_code)
     
-    # 为每个Python文件生成测试
-    async with aiohttp.ClientSession() as session:
-        for py_file in python_files:
-            # 调用OpenAI API生成测试代码
-            async with session.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "gpt-3.5-turbo",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "你是一个Python测试专家,请根据提供的代码生成单元测试"
-                        },
-                        {
-                            "role": "user", 
-                            "content": f"请为以下Python代码生成单元测试:\n\n{py_file['content']}"
-                        }
-                    ],
-                    "temperature": 0.7
-                }
-            ) as response:
-                result = await response.json()
-                test_content = result['choices'][0]['message']['content']
-                
-                # 如果返回的不是完整的测试代码,则使用模板包装
-                if not test_content.startswith("import unittest"):
-                    test_content = f"""import unittest
-from {py_file['name'].replace('.py','')} import *
+def extract_functions_without_tests(contents):
+    function_names = []
+    for content in contents:
+        if content.type == 'file' and content.name.endswith('.py'):
+            file_content = base64.b64decode(content.content).decode("utf-8")
+            functions = re.findall(r'def (\w+)\(', file_content)
+            for func in functions:
+                if not is_tested(func, file_content):
+                    function_names.append(func)
+    return function_names
 
-{test_content}
-"""
-                # 提交测试文件
-                test_file_name = f"tests/test_{py_file['name']}"
-                await gh.put(
-                    f"/repos/{repo_full_name}/contents/{test_file_name}",
-                    data={
-                        "message": f"为 {py_file['name']} 添加单元测试",
-                        "content": test_content,
-                        "branch": branch_name
-                    },
-                    oauth_token=installation_token["token"]
-                )
-    
-    # 创建PR
-    await gh.post(
-        f"/repos/{repo_full_name}/pulls",
-        data={
-            "title": "添加单元测试",
-            "body": "自动生成的单元测试PR",
-            "head": branch_name,
-            "base": "main"
-        },
-        oauth_token=installation_token["token"]
-    )
-    
-    # 创建评论
-    comments_url = f"/repos/{repo_full_name}/issues/{pr_number}/comments"
-    await gh.post(
-        comments_url,
-        data={
-            "body": "已为Python文件生成单元测试并提交PR"
-        },
-        oauth_token=installation_token["token"]
-    )
+def is_tested(function_name, file_content):
+    test_pattern = f'test_{function_name}'  # 假设测试函数名为 test_<函数名>
+    if test_pattern in file_content:
+        return True
+    return False
 
-if __name__ == "__main__":  # pragma: no cover
-    app = web.Application()
-    app.router.add_routes(routes)
-    
-    port = int(os.environ.get("PORT", DEFAULT_PORT))
-    web.run_app(app, port=port)
+def generate_unit_tests(function_names):
+    test_code = """import unittest
+class TestGenerated(unittest.TestCase):\n"""
+    for func in function_names:
+        test_code += f"""
+    def test_{func}(self):
+        # Test {func} function
+        self.assertEqual({func}(), expected_output)  # Replace with actual test logic\n"""
+    return test_code
+
+def create_pr_with_tests(repo, branch, test_code):
+    base_branch = 'main'  # 目标分支
+    head_branch = branch  # 源分支
+    # 获取目标分支和源分支的最新提交
+    base_commit = repo.get_commit(base_branch)
+    head_commit = repo.get_commit(head_branch)
+    # 检查是否有差异
+    if base_commit.sha == head_commit.sha:
+        print(f"No changes between {base_branch} and {head_branch}, skipping PR creation.")
+        return  # 如果没有差异，不创建 PR
+    # 提交生成的单元测试文件
+    test_file_path = 'tests/test_generated.py'
+    try:
+        contents = repo.get_contents(test_file_path, ref=head_branch)
+        sha = contents.sha
+    except:
+        sha = None
+    if sha:
+        repo.update_file(test_file_path, "Updating unit tests", test_code, sha=sha, branch=head_branch)
+    else:
+        repo.create_file(test_file_path, "Adding unit tests", test_code, branch=head_branch)
+    # 创建 PR
+    pr_title = "Add unit tests for untested functions"
+    pr_body = "This PR automatically adds unit tests for functions that lacked tests in the previous code."
+    repo.create_pull(title=pr_title, body=pr_body, head=head_branch, base=base_branch)
+    print("PR created with unit tests.")
+
+if __name__ == '__main__':
+    app.run(port=30004, host="0.0.0.0")
