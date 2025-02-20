@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "github-app",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "GITHUB_APP_ID": "1151685",
+                "WEBHOOK_SECRET": "Iv23liespSnKYzdZENfv",
+                "DOUBAO_API_KEY": "ff9ed2dd-cdf0-40d4-b4ec-d3aa19e2bd0b"
+            }
+        }
+    ]
+}
