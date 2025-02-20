@@ -95,12 +95,105 @@ async def pr_opened(event, gh, *args, **kwargs):
     repo_full_name = event.data["repository"]["full_name"]
     pr_number = event.data["pull_request"]["number"]
     
+    # 获取PR中的文件列表
+    files_url = f"/repos/{repo_full_name}/pulls/{pr_number}/files"
+    files = await gh.getitem(files_url, oauth_token=installation_token["token"])
+    
+    # 遍历文件列表,找出Python文件并获取内容
+    python_files = []
+    async with aiohttp.ClientSession() as session:
+        for file in files:
+            if file["filename"].endswith(".py"):
+                async with session.get(file["raw_url"]) as response:
+                    content = await response.text()
+                    python_files.append({
+                        "name": file["filename"],
+                        "content": content
+                    })
+    
+    if not python_files:
+        return
+        
+    # 创建新分支
+    branch_name = f"add-tests-{pr_number}"
+    main_branch = await gh.getitem(
+        f"/repos/{repo_full_name}/git/ref/heads/main",
+        oauth_token=installation_token["token"]
+    )
+    await gh.post(
+        f"/repos/{repo_full_name}/git/refs",
+        data={
+            "ref": f"refs/heads/{branch_name}",
+            "sha": main_branch["object"]["sha"]
+        },
+        oauth_token=installation_token["token"]
+    )
+    
+    # 为每个Python文件生成测试
+    async with aiohttp.ClientSession() as session:
+        for py_file in python_files:
+            # 调用OpenAI API生成测试代码
+            async with session.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-3.5-turbo",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "你是一个Python测试专家,请根据提供的代码生成单元测试"
+                        },
+                        {
+                            "role": "user", 
+                            "content": f"请为以下Python代码生成单元测试:\n\n{py_file['content']}"
+                        }
+                    ],
+                    "temperature": 0.7
+                }
+            ) as response:
+                result = await response.json()
+                test_content = result['choices'][0]['message']['content']
+                
+                # 如果返回的不是完整的测试代码,则使用模板包装
+                if not test_content.startswith("import unittest"):
+                    test_content = f"""import unittest
+from {py_file['name'].replace('.py','')} import *
+
+{test_content}
+"""
+                # 提交测试文件
+                test_file_name = f"tests/test_{py_file['name']}"
+                await gh.put(
+                    f"/repos/{repo_full_name}/contents/{test_file_name}",
+                    data={
+                        "message": f"为 {py_file['name']} 添加单元测试",
+                        "content": test_content,
+                        "branch": branch_name
+                    },
+                    oauth_token=installation_token["token"]
+                )
+    
+    # 创建PR
+    await gh.post(
+        f"/repos/{repo_full_name}/pulls",
+        data={
+            "title": "添加单元测试",
+            "body": "自动生成的单元测试PR",
+            "head": branch_name,
+            "base": "main"
+        },
+        oauth_token=installation_token["token"]
+    )
+    
     # 创建评论
     comments_url = f"/repos/{repo_full_name}/issues/{pr_number}/comments"
     await gh.post(
         comments_url,
         data={
-            "body": "感谢提交PR！我会尽快审核。"
+            "body": "已为Python文件生成单元测试并提交PR"
         },
         oauth_token=installation_token["token"]
     )
